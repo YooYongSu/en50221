@@ -1566,20 +1566,31 @@ static int dvb_ca_en50221_io_open(struct inode *inode, struct file *file)
 		return err;
 	}
 
-	for (i = 0; i < ca->slot_count; i++) {
+	/* now initialise each slot */
+	for (i = 0; i < slot_count; i++) {
+		memset(&ca->slot_info[i], 0, sizeof(struct dvb_ca_slot));
+		ca->slot_info[i].slot_state = DVB_CA_SLOTSTATE_NONE;
+		atomic_set(&ca->slot_info[i].camchange_count, 0);
+		ca->slot_info[i].camchange_type = DVB_CA_EN50221_CAMCHANGE_REMOVED;
+	}
 
-		if (ca->slot_info[i].slot_state == DVB_CA_SLOTSTATE_RUNNING) {
-			if (ca->slot_info[i].rx_buffer.data != NULL) {
-				/* it is safe to call this here without locks because
-				 * ca->open == 0. Data is not read in this case */
-				dvb_ringbuffer_flush(&ca->slot_info[i].rx_buffer);
-			}
-		}
+	if (signal_pending(current)) {
+		ret = -EINTR;
+		return -1;
+	}
+	mb();
+
+	/* create a kthread for monitoring this CA device */
+	ca->thread = kthread_run(dvb_ca_en50221_thread, ca, "kdvb-ca-%i:%i",
+				 ca->dvbdev->adapter->num, ca->dvbdev->id);
+	if (IS_ERR(ca->thread)) {
+		ret = PTR_ERR(ca->thread);
+		printk("dvb_ca_init: failed to start kernel_thread (%d)\n",
+			ret);
+		return -1;
 	}
 
 	ca->open = 1;
-	dvb_ca_en50221_thread_update_delay(ca);
-	dvb_ca_en50221_thread_wakeup(ca);
 
 	return 0;
 }
@@ -1608,6 +1619,12 @@ static int dvb_ca_en50221_io_release(struct inode *inode, struct file *file)
 	err = dvb_generic_release(inode, file);
 
 	module_put(ca->pub->owner);
+
+	kthread_stop(ca->thread);
+
+	for (i = 0; i < ca->slot_count; i++) {
+		dvb_ca_en50221_slot_shutdown(ca, i);
+	}
 
 	return err;
 }
@@ -1724,30 +1741,13 @@ int dvb_ca_en50221_init(struct dvb_adapter *dvb_adapter,
 
 	/* now initialise each slot */
 	for (i = 0; i < slot_count; i++) {
-		memset(&ca->slot_info[i], 0, sizeof(struct dvb_ca_slot));
-		ca->slot_info[i].slot_state = DVB_CA_SLOTSTATE_NONE;
-		atomic_set(&ca->slot_info[i].camchange_count, 0);
-		ca->slot_info[i].camchange_type = DVB_CA_EN50221_CAMCHANGE_REMOVED;
 		mutex_init(&ca->slot_info[i].slot_lock);
 	}
 
 	mutex_init(&ca->ioctl_mutex);
 
-	if (signal_pending(current)) {
-		ret = -EINTR;
-		goto unregister_device;
-	}
 	mb();
 
-	/* create a kthread for monitoring this CA device */
-	ca->thread = kthread_run(dvb_ca_en50221_thread, ca, "kdvb-ca-%i:%i",
-				 ca->dvbdev->adapter->num, ca->dvbdev->id);
-	if (IS_ERR(ca->thread)) {
-		ret = PTR_ERR(ca->thread);
-		printk("dvb_ca_init: failed to start kernel_thread (%d)\n",
-			ret);
-		goto unregister_device;
-	}
 	return 0;
 
 unregister_device:
